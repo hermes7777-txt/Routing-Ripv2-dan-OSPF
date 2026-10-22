@@ -1,0 +1,378 @@
+# RIPv2 (Routing Information Protocol versi 2)
+
+Catatan lengkap tentang RIPv2: konsep, format paket, cara kerja, timer, pencegahan loop, konfigurasi (Cisco IOS & MikroTik), aspek keamanan, dan troubleshooting.
+
+## Daftar Isi
+
+1. [Gambaran Umum](#1-gambaran-umum)
+2. [RIPv1 vs RIPv2](#2-ripv1-vs-ripv2)
+3. [Format Paket RIPv2](#3-format-paket-ripv2)
+4. [Cara Kerja RIPv2](#4-cara-kerja-ripv2)
+5. [Mekanisme Pencegahan Routing Loop](#5-mekanisme-pencegahan-routing-loop)
+6. [Pemilihan Rute & Load Balancing](#6-pemilihan-rute--load-balancing)
+7. [Summarization & Discontiguous Network](#7-summarization--discontiguous-network)
+8. [Konfigurasi Cisco IOS](#8-konfigurasi-cisco-ios)
+9. [Konfigurasi MikroTik](#9-konfigurasi-mikrotik-routeros-v6)
+10. [Aspek Keamanan](#10-aspek-keamanan)
+11. [Troubleshooting](#11-troubleshooting)
+12. [Kelebihan, Kekurangan & Kapan Dipakai](#12-kelebihan-kekurangan--kapan-dipakai)
+13. [Ringkasan Cepat](#13-ringkasan-cepat)
+
+---
+
+## 1. Gambaran Umum
+
+**RIP** adalah routing protocol jenis **distance vector** yang memakai algoritma **Bellman-Ford**. RIPv2 adalah penyempurnaan RIPv1 agar mendukung jaringan modern (classless, VLSM, autentikasi).
+
+| Atribut | Nilai |
+|---|---|
+| Standar | RFC 2453 (RIPv2, STD 56); autentikasi kriptografi: RFC 4822 |
+| Jenis | Distance vector, IGP |
+| Transport | UDP port **520** |
+| Alamat tujuan | Multicast **224.0.0.9** |
+| Metric | **Hop count** (1-15; **16 = unreachable**) |
+| Administrative Distance | 120 (Cisco) |
+| Update berkala | Setiap 30 detik |
+| Diameter maksimum | 15 router |
+| Versi IPv6 | RIPng (RFC 2080, UDP 521, FF02::9) |
+
+Prinsip distance vector: router **tidak mengetahui topologi penuh**. Ia hanya tahu "untuk ke jaringan X, lewat tetangga Y, jaraknya Z hop" (*routing by rumor*). Karena itu RIP sederhana, tetapi konvergensinya lambat dan rawan loop.
+
+---
+
+## 2. RIPv1 vs RIPv2
+
+| Fitur | RIPv1 | RIPv2 |
+|---|---|---|
+| Jenis | Classful | **Classless** |
+| Subnet mask dalam update | Tidak ada | **Ada** (mendukung VLSM/CIDR) |
+| Pengiriman update | Broadcast 255.255.255.255 | **Multicast 224.0.0.9** |
+| Autentikasi | Tidak ada | **Plaintext & MD5** (RFC 4822: HMAC-SHA) |
+| Next hop eksplisit | Tidak | **Ya** |
+| Route tag | Tidak | **Ya** |
+| Auto-summary | Selalu aktif | Aktif default di Cisco (**sebaiknya dimatikan**) |
+
+Keuntungan multicast: host/perangkat non-RIP tidak perlu memproses update, sehingga beban CPU lebih ringan.
+
+---
+
+## 3. Format Paket RIPv2
+
+Pesan RIP dibungkus dalam UDP (src & dst port 520).
+
+### Header (4 byte)
+
+| Field | Ukuran | Keterangan |
+|---|---|---|
+| Command | 1 byte | 1 = Request, 2 = Response |
+| Version | 1 byte | 2 |
+| Must be zero | 2 byte | Tidak dipakai |
+
+### Route Table Entry / RTE (20 byte, maksimal 25 per pesan)
+
+| Field | Ukuran | Keterangan |
+|---|---|---|
+| Address Family Identifier | 2 byte | 2 = IP |
+| Route Tag | 2 byte | Penanda rute (misal rute eksternal) |
+| IP Address | 4 byte | Network tujuan |
+| Subnet Mask | 4 byte | Mask jaringan tujuan |
+| Next Hop | 4 byte | 0.0.0.0 = pengirim update sendiri |
+| Metric | 4 byte | 1-16 |
+
+Ukuran maksimum = 4 + (25 x 20) = **504 byte** payload RIP. Karena itu tabel routing besar dipecah ke beberapa paket.
+
+### Pesan autentikasi
+
+Jika autentikasi dipakai, **RTE pertama** dipakai untuk autentikasi (AFI = `0xFFFF`), sehingga sisa RTE maksimal **24**.
+
+| Tipe | Keterangan |
+|---|---|
+| `2` | Plaintext (password 16 byte) |
+| `3` | Keyed MD5 / kriptografi (trailer di akhir paket) |
+
+---
+
+## 4. Cara Kerja RIPv2
+
+### 4.1 Dua jenis pesan
+
+- **Request:** dikirim saat router baru aktif untuk meminta seluruh tabel tetangga (AFI = 0 dan metric = 16 berarti "kirim semua").
+- **Response:** berisi daftar rute. Bisa *solicited* (jawaban Request), *periodic* (tiap 30 detik), atau *triggered* (saat ada perubahan topologi).
+
+### 4.2 Alur kerja
+
+1. Interface aktif, lalu router mengirim **Request** ke 224.0.0.9.
+2. Tetangga membalas **Response** berisi tabel routing-nya.
+3. Router memasukkan rute connected (diumumkan dengan metric 1).
+4. Setiap 30 detik (dengan variasi acak kecil untuk menghindari sinkronisasi update) router mengirim seluruh tabel (kecuali yang diblokir split horizon).
+5. Perubahan topologi segera diumumkan lewat **triggered update**, dengan penundaan acak 1-5 detik agar jaringan tidak banjir update.
+
+### 4.3 Algoritma pemrosesan update (RFC 2453)
+
+Untuk tiap RTE yang diterima:
+
+1. **Validasi:** metric harus 1-16, address valid, bukan loopback/multicast.
+2. Hitung metric baru: `metric_baru = min(metric_diterima + cost_interface, 16)`. Cost default = 1.
+3. Cari rute yang sama di tabel:
+   - **Belum ada** dan metric < 16: tambahkan rute, set timer.
+   - **Ada, dari router yang sama:** reset timeout timer. Jika metric berubah (naik atau turun), **ikuti** perubahan itu.
+   - **Ada, dari router lain:** ganti hanya jika metric baru **lebih kecil**.
+4. Jika metric menjadi 16, rute ditandai tidak valid, masuk fase garbage collection, dan dikirim triggered update.
+
+### 4.4 Timer
+
+| Timer | Default Cisco | Fungsi |
+|---|---|---|
+| Update | 30 dtk | Interval pengiriman tabel |
+| Invalid (timeout) | 180 dtk | Rute ditandai *possibly down* (metric 16) jika tidak ada update |
+| Holddown | 180 dtk | Mengabaikan info rute yang lebih buruk/berbeda sementara waktu |
+| Flush | 240 dtk | Rute dihapus dari tabel |
+
+> **Catatan:** RFC 2453 memakai istilah *timeout 180 s* dan *garbage-collection 120 s*. Cisco memakai *flush 240 s* dengan holddown berjalan paralel. Semua router dalam satu domain sebaiknya memakai timer yang **sama**, kalau tidak rute bisa flapping.
+
+---
+
+## 5. Mekanisme Pencegahan Routing Loop
+
+Distance vector rentan terhadap **count-to-infinity**.
+
+**Contoh:** `R1 -- R2 -- R3`, dengan jaringan X terhubung langsung ke R1. R2 mempelajari X dengan metric 2, R3 dengan metric 3. Saat X putus:
+
+- R1 menghapus X, tetapi sebelum kabar itu sampai, R2 sempat mengumumkan "aku bisa ke X (metric 2)".
+- R1 menerima info itu dan mengira X bisa dicapai lewat R2 (metric 3). R2 lalu mendengar dari R1 bahwa X metric 3, jadi menaikkan menjadi 4.
+- R1 dan R2 saling bertukar info dan metric naik 3, 4, 5, ... sampai 16.
+
+Mekanisme yang dipakai RIP:
+
+1. **Maximum hop count = 15.** Metric 16 dianggap infinity, sehingga loop berhenti di 16.
+2. **Split horizon.** Rute tidak diumumkan kembali ke interface tempat rute itu dipelajari.
+3. **Route poisoning.** Rute yang putus diumumkan dengan metric 16 agar tetangga cepat menghapusnya.
+4. **Poison reverse.** Variasi split horizon: rute dikirim balik ke sumbernya dengan metric 16. Bukan perilaku default RIP di Cisco (default-nya split horizon sederhana), tetapi dijelaskan dalam RFC.
+5. **Triggered update.** Perubahan diumumkan segera tanpa menunggu 30 detik.
+6. **Holddown timer.** Setelah rute dinyatakan down, info dari tetangga lain tentang rute itu diabaikan sementara.
+
+---
+
+## 6. Pemilihan Rute & Load Balancing
+
+- Metric = jumlah hop. RIP **tidak** memperhitungkan bandwidth, delay, atau beban. Jalur 1 hop via link 56 kbps dianggap lebih baik daripada 2 hop via 10 Gbps. Ini kelemahan utama RIP.
+- **ECMP:** jika ada beberapa jalur dengan metric sama, RIP menginstal hingga **4 rute** (default Cisco, diatur dengan `maximum-paths`, batas atas tergantung versi IOS) dan melakukan load balancing.
+- Jika beberapa protokol menawarkan rute yang sama, **Administrative Distance** menentukan pemenang:
+
+| Sumber rute | AD |
+|---|---|
+| Connected | 0 |
+| Static | 1 |
+| EIGRP | 90 |
+| OSPF | 110 |
+| **RIP** | **120** |
+
+---
+
+## 7. Summarization & Discontiguous Network
+
+**Auto-summary** meringkas rute ke batas classful saat melewati batas major network (misal `10.1.1.0/24` dan `10.2.2.0/24` diumumkan sebagai `10.0.0.0/8`).
+
+Masalahnya pada **discontiguous network**: jika subnet dari satu major network berada di dua sisi yang dipisahkan jaringan lain, kedua router sama-sama mengumumkan `10.0.0.0/8`, sehingga routing menjadi kacau. Solusinya:
+
+```text
+router rip
+ no auto-summary
+```
+
+**Manual summarization** per interface:
+
+```text
+interface GigabitEthernet0/1
+ ip summary-address rip 10.1.0.0 255.255.0.0
+```
+
+---
+
+## 8. Konfigurasi Cisco IOS
+
+### Topologi contoh
+
+```text
+LAN-A ── R1 ──(10.0.12.0/30)── R2 ──(10.0.23.0/30)── R3 ── LAN-C
+192.168.1.0/24                                        192.168.3.0/24
+```
+
+### 8.1 Konfigurasi dasar (R1)
+
+```text
+R1(config)# router rip
+R1(config-router)# version 2
+R1(config-router)# no auto-summary
+R1(config-router)# network 192.168.1.0
+R1(config-router)# network 10.0.0.0
+R1(config-router)# passive-interface GigabitEthernet0/0
+```
+
+Penjelasan:
+
+- `network` di RIP **selalu classful**. `network 10.0.0.0` mengaktifkan RIP di semua interface dalam 10.0.0.0/8 (termasuk 10.0.12.x dan 10.0.23.x).
+- `passive-interface` mencegah update keluar ke LAN (tidak ada router di sana), tetapi network LAN tetap diumumkan.
+
+### 8.2 Verifikasi
+
+```text
+R1# show ip route rip
+R    10.0.23.0/30 [120/1] via 10.0.12.2, 00:00:14, GigabitEthernet0/1
+R    192.168.3.0/24 [120/2] via 10.0.12.2, 00:00:14, GigabitEthernet0/1
+```
+
+`[120/2]` berarti AD = 120 dan metric = 2 hop.
+
+| Perintah | Fungsi |
+|---|---|
+| `show ip protocols` | Versi RIP, timer, network, passive interface, sumber update, autentikasi |
+| `show ip rip database` | Database RIP (termasuk rute yang belum masuk routing table) |
+| `show ip route rip` | Rute hasil RIP |
+| `debug ip rip` / `debug ip rip events` | Melihat update yang dikirim/diterima secara real-time |
+
+### 8.3 Autentikasi MD5
+
+```text
+key chain RIP-KEY
+ key 1
+  key-string RahasiaKu123
+!
+interface GigabitEthernet0/1
+ ip rip authentication mode md5
+ ip rip authentication key-chain RIP-KEY
+```
+
+- Jika hanya `key-chain` yang dipasang tanpa `mode md5`, Cisco memakai **plaintext** (password terlihat jelas di Wireshark).
+- Key dan mode harus sama di kedua sisi link.
+- MD5 sudah dianggap lemah, jadi gunakan HMAC-SHA (RFC 4822) bila platform mendukung.
+
+### 8.4 Fitur lanjutan
+
+```text
+router rip
+ version 2
+ no auto-summary
+ ! sebarkan default route (butuh: ip route 0.0.0.0 0.0.0.0 ...)
+ default-information originate
+ ! masukkan rute static ke RIP
+ redistribute static metric 2
+ ! metric default untuk rute hasil redistribusi
+ default-metric 3
+ ! timer: update, invalid, holddown, flush
+ timers basic 30 180 180 240
+ ! kirim update unicast (jaringan non-broadcast)
+ neighbor 10.0.12.2
+ ! tambah metric pada update keluar (mempengaruhi pemilihan jalur)
+ offset-list 0 out 2 GigabitEthernet0/1
+ ! filter rute yang diterima
+ distribute-list 10 in GigabitEthernet0/1
+ ! jumlah jalur ECMP
+ maximum-paths 6
+!
+interface GigabitEthernet0/1
+ ! hanya bila benar-benar perlu (misal hub-and-spoke NBMA)
+ no ip split-horizon
+ ip rip send version 2
+ ip rip receive version 2
+```
+
+---
+
+## 9. Konfigurasi MikroTik (RouterOS v6)
+
+```text
+/routing rip network add network=10.0.0.0/8
+/routing rip network add network=192.168.1.0/24
+/routing rip interface add interface=ether2 receive=v2 send=v2 \
+    authentication=md5 authentication-key=RahasiaKu123
+/routing rip set redistribute-connected=yes redistribute-static=yes
+```
+
+> Struktur perintah RIP di **RouterOS v7** berbeda dari v6, jadi cek dokumentasi resmi MikroTik sesuai versi yang dipakai.
+
+---
+
+## 10. Aspek Keamanan
+
+RIP dirancang tanpa asumsi keamanan, sehingga rawan serangan.
+
+| Ancaman | Penjelasan | Mitigasi |
+|---|---|---|
+| **Route injection / spoofing** | Penyerang di segmen yang sama mengirim update RIP palsu (UDP 520, tanpa autentikasi) dan mengalihkan trafik | Autentikasi MD5/HMAC-SHA |
+| **Blackhole** | Rute palsu dengan metric rendah menarik trafik lalu membuangnya | Prefix filtering (`distribute-list`) |
+| **MITM** | Trafik dialihkan lewat host penyerang lalu diteruskan | Autentikasi, segmentasi, port security |
+| **Sniffing** | Plaintext auth atau tanpa auth membocorkan topologi | Gunakan auth kriptografi |
+| **DoS** | Banjir update palsu membebani CPU router | Passive-interface, ACL pada UDP 520, rate limiting |
+
+### Praktik pertahanan
+
+- Gunakan `passive-interface default`, lalu aktifkan hanya interface yang memang punya tetangga RIP.
+- Pakai autentikasi kriptografi di setiap link antar-router.
+- Filter prefix yang boleh diterima dan diumumkan, terutama pada link ke pihak lain.
+- Batasi sumber UDP 520 dengan ACL pada interface yang menghadap user.
+- Untuk lab pembelajaran, tangkap trafik dengan filter Wireshark `rip` atau `udp.port == 520`. Lihat sendiri bagaimana update plaintext terbaca, lalu bandingkan dengan MD5.
+
+---
+
+## 11. Troubleshooting
+
+| Gejala | Kemungkinan penyebab | Cek |
+|---|---|---|
+| Rute tidak muncul | `network` statement salah, atau interface passive padahal ada tetangga | `show ip protocols` |
+| Rute hanya summary (/8) | `no auto-summary` belum diatur | `show ip route` |
+| Update diterima tapi tidak diinstal | Mismatch versi (v1 vs v2) atau subnet berbeda | `debug ip rip` |
+| Neighbor "bad authentication" | Key/mode tidak cocok | `debug ip rip` |
+| Rute flapping | Timer tidak seragam, link tidak stabil | `show ip rip database`, `show interfaces` |
+| Rute hilang di jarak jauh | Hop count > 15 | `show ip route` |
+| Update tidak sampai | ACL memblokir UDP 520 / 224.0.0.9 | `show access-lists` |
+| Update diabaikan | Sumber update bukan di subnet yang sama | `debug ip rip` |
+
+---
+
+## 12. Kelebihan, Kekurangan & Kapan Dipakai
+
+### Kelebihan
+
+- Konfigurasi sangat sederhana dan beban CPU/memori rendah.
+- Didukung hampir semua perangkat (Cisco, MikroTik, Juniper, Linux/FRR/Quagga).
+- Cocok untuk belajar konsep dasar routing dinamis.
+
+### Kekurangan
+
+- Batas 15 hop, tidak cocok untuk jaringan besar.
+- Konvergensi lambat (berpotensi hingga hitungan menit).
+- Metric hanya hop count, tanpa mempertimbangkan bandwidth.
+- Update periodik seluruh tabel membuang bandwidth.
+- Keamanan lemah tanpa autentikasi.
+
+### Perbandingan singkat
+
+| | RIPv2 | OSPF | EIGRP |
+|---|---|---|---|
+| Jenis | Distance vector | Link-state | Advanced distance vector |
+| Metric | Hop count | Cost (bandwidth) | Bandwidth + delay (composite) |
+| Konvergensi | Lambat | Cepat | Sangat cepat |
+| Skala | Kecil | Besar | Menengah-besar |
+| Kompleksitas | Rendah | Tinggi | Sedang |
+
+RIPv2 masih relevan untuk jaringan kecil, lab, atau perangkat sederhana. Untuk jaringan produksi yang lebih besar, OSPF atau EIGRP biasanya lebih tepat.
+
+---
+
+## 13. Ringkasan Cepat
+
+- RIPv2 = distance vector, classless, multicast **224.0.0.9**, UDP **520**.
+- Metric = hop count, maksimum **15**, 16 = unreachable, AD **120**.
+- Timer: **30 / 180 / 180 / 240** detik.
+- Pencegah loop: split horizon, route poisoning, triggered update, holddown, max hop.
+- Selalu pakai `version 2` dan `no auto-summary`.
+- Aktifkan autentikasi dan `passive-interface` ke arah LAN user.
+
+---
+
+## Referensi
+
+- [RFC 2453 - RIP Version 2](https://www.rfc-editor.org/rfc/rfc2453)
+- [RFC 4822 - RIPv2 Cryptographic Authentication](https://www.rfc-editor.org/rfc/rfc4822)
+- [RFC 2080 - RIPng for IPv6](https://www.rfc-editor.org/rfc/rfc2080)
